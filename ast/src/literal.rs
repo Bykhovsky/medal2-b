@@ -12,6 +12,7 @@ pub enum Literal {
     Nil,
     Boolean(bool),
     Number(f64),
+    Integer(i64),
     String(Vec<u8>),
     Vector(f32, f32, f32),
 }
@@ -26,6 +27,7 @@ impl Reduce for Literal {
             Literal::Boolean(false) | Literal::Nil => false,
             Literal::Boolean(true)
             | Literal::Number(_)
+            | Literal::Integer(_)
             | Literal::String(_)
             | Literal::Vector(..) => true,
         })
@@ -38,7 +40,7 @@ impl Infer for Literal {
         match self {
             Literal::Nil => Type::Nil,
             Literal::Boolean(_) => Type::Boolean,
-            Literal::Number(_) => Type::Number,
+            Literal::Number(_) | Literal::Integer(_) => Type::Number,
             Literal::String(_) => Type::String,
             Literal::Vector(..) => Type::Vector,
         }
@@ -71,6 +73,8 @@ impl fmt::Display for Literal {
                 let printed = buffer.format_finite(value);
                 write!(f, "{}", printed.strip_suffix(".0").unwrap_or(printed))
             }
+            Literal::Integer(value) if *value >= 0 => write!(f, "{}i", value),
+            Literal::Integer(value) => write!(f, "0x{:x}i", *value as u64),
             Literal::String(value) => {
                 write!(
                     f,
@@ -80,5 +84,23 @@ impl fmt::Display for Literal {
             }
             Literal::Vector(x, y, z) => write!(f, "Vector3.new({}, {}, {})", x, y, z),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Literal;
+
+    #[test]
+    fn formats_integer_literals_without_losing_precision() {
+        assert_eq!(
+            Literal::Integer(i64::MAX).to_string(),
+            "9223372036854775807i"
+        );
+        assert_eq!(Literal::Integer(-1).to_string(), "0xffffffffffffffffi");
+        assert_eq!(
+            Literal::Integer(i64::MIN).to_string(),
+            "0x8000000000000000i"
+        );
     }
 }
