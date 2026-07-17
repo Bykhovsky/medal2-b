@@ -1,9 +1,7 @@
-use core::num;
-
 use nom::{
-    complete::take,
+    error::{Error, ErrorKind},
     number::complete::{le_u32, le_u8},
-    IResult,
+    Err, IResult,
 };
 use nom_leb128::leb128_usize;
 
@@ -32,12 +30,12 @@ pub struct Function {
 }
 
 impl Function {
-    fn parse_instructions(vec: &Vec<u32>, encode_key: u8) -> Vec<Instruction> {
-        let mut v: Vec<Instruction> = Vec::new();
+    fn parse_instructions(words: &[u32], encode_key: u8) -> Result<Vec<Instruction>, ErrorKind> {
+        let mut instructions = Vec::with_capacity(words.len());
         let mut pc = 0;
 
-        loop {
-            let ins = Instruction::parse(vec[pc], encode_key).unwrap();
+        while pc < words.len() {
+            let ins = Instruction::parse(words[pc], encode_key)?;
             let op = match ins {
                 Instruction::BC { op_code, .. } => op_code,
                 Instruction::AD { op_code, .. } => op_code,
@@ -68,14 +66,17 @@ impl Function {
                 | OpCode::LOP_JUMPXEQKNIL
                 | OpCode::LOP_JUMPXEQKB
                 | OpCode::LOP_JUMPXEQKN
-                | OpCode::LOP_JUMPXEQKS => {
-                    let aux = vec[pc + 1];
+                | OpCode::LOP_JUMPXEQKS
+                | OpCode::LOP_GETUDATAKS
+                | OpCode::LOP_SETUDATAKS
+                | OpCode::LOP_NAMECALLUDATA => {
+                    let aux = *words.get(pc + 1).ok_or(ErrorKind::Eof)?;
                     pc += 2;
                     match ins {
                         Instruction::BC {
                             op_code, a, b, c, ..
                         } => {
-                            v.push(Instruction::BC {
+                            instructions.push(Instruction::BC {
                                 op_code,
                                 a,
                                 b,
@@ -84,11 +85,13 @@ impl Function {
                             });
                         }
                         Instruction::AD { op_code, a, d, .. } => {
-                            v.push(Instruction::AD { op_code, a, d, aux });
+                            instructions.push(Instruction::AD { op_code, a, d, aux });
                         }
-                        _ => unreachable!(),
+                        _ => return Err(ErrorKind::Tag),
                     }
-                    v.push(Instruction::BC {
+                    // Preserve bytecode word offsets: the lifter's CFG and jump
+                    // calculations address AUX words as a synthetic NOP.
+                    instructions.push(Instruction::BC {
                         op_code: OpCode::LOP_NOP,
                         a: 0,
                         b: 0,
@@ -97,17 +100,13 @@ impl Function {
                     });
                 }
                 _ => {
-                    v.push(ins);
+                    instructions.push(ins);
                     pc += 1;
                 }
             }
-
-            if pc == vec.len() {
-                break;
-            }
         }
 
-        v
+        Ok(instructions)
     }
 
     pub(crate) fn parse(input: &[u8], encode_key: u8) -> IResult<&[u8], Self> {
@@ -116,12 +115,13 @@ impl Function {
         let (input, num_upvalues) = le_u8(input)?;
         let (input, is_vararg) = le_u8(input)?;
 
-        let (input, flags) = le_u8(input)?;
+        let (input, _flags) = le_u8(input)?;
         let (input, _) = parse_list(input, le_u8)?;
 
         let (input, u32_instructions) = parse_list(input, le_u32)?;
         //let (input, instructions) = parse_list(input, Function::parse_instrution)?;
-        let instructions = Self::parse_instructions(&u32_instructions, encode_key);
+        let instructions = Self::parse_instructions(&u32_instructions, encode_key)
+            .map_err(|kind| Err::Failure(Error::new(input, kind)))?;
         let (input, constants) = parse_list(input, Constant::parse)?;
         let (input, functions) = parse_list(input, leb128_usize)?;
         let (input, line_defined) = leb128_usize(input)?;
@@ -156,7 +156,6 @@ impl Function {
         let input = match le_u8(input)? {
             (input, 0) => input,
             (input, _) => {
-                panic!("we have debug info");
                 let (mut input, num_locvars) = leb128_usize(input)?;
                 for _ in 0..num_locvars {
                     (input, _) = leb128_usize(input)?;
@@ -188,5 +187,46 @@ impl Function {
                 abs_line_info_delta,
             },
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn consumes_userdata_aux_word_and_preserves_word_offsets() {
+        let header = u32::from(OpCode::LOP_GETUDATAKS as u8) | (1 << 8) | (2 << 16);
+        let aux = (0xabcd << 16) | 7;
+
+        let instructions = Function::parse_instructions(&[header, aux], 1).unwrap();
+
+        assert_eq!(instructions.len(), 2);
+        assert!(matches!(
+            instructions[0],
+            Instruction::BC {
+                op_code: OpCode::LOP_GETUDATAKS,
+                a: 1,
+                b: 2,
+                aux: parsed_aux,
+                ..
+            } if parsed_aux == aux
+        ));
+        assert!(matches!(
+            instructions[1],
+            Instruction::BC {
+                op_code: OpCode::LOP_NOP,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_aux_word() {
+        let header = u32::from(OpCode::LOP_GETUDATAKS as u8);
+        assert!(matches!(
+            Function::parse_instructions(&[header], 1),
+            Err(ErrorKind::Eof)
+        ));
     }
 }
