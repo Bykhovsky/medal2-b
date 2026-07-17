@@ -30,11 +30,11 @@ pub fn deserialize(bytecode: &[u8], encode_key: u8) -> Result<bytecode::Bytecode
     }
 
     match bytecode::Bytecode::parse(bytecode, encode_key) {
-        Ok((remaining, deserialized_bytecode)) if remaining.is_empty() => Ok(deserialized_bytecode),
-        Ok((remaining, _)) => Err(format!(
-            "bytecode has {} unparsed trailing bytes",
-            remaining.len()
-        )),
+        // Roblox bytecode providers can append host-specific data after the
+        // serialized Luau chunk. The Luau chunk itself ends after the main
+        // function id, so preserve the original deserializer's prefix-parsing
+        // behavior instead of rejecting an otherwise valid chunk.
+        Ok((_remaining, deserialized_bytecode)) => Ok(deserialized_bytecode),
         Err(err) => Err(err.to_string()),
     }
 }
@@ -173,6 +173,18 @@ mod tests {
 
         assert!(source.contains("answer"), "{source}");
         assert!(source.contains("42i"), "{source}");
+    }
+
+    #[test]
+    fn accepts_host_data_after_a_complete_version_nine_chunk() {
+        let encode_key = 203;
+        let mut bytecode = version_nine_chunk(encode_key);
+        bytecode.extend_from_slice(&[0xa5; 24]);
+
+        let source = crate::decompile_bytecode(&bytecode, encode_key);
+
+        assert!(!source.contains("failed to deserialize"), "{source}");
+        assert!(source.contains(".field"), "{source}");
     }
 
     #[test]
