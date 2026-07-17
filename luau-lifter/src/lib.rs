@@ -62,7 +62,10 @@ struct Args {
 }
 
 pub fn decompile_bytecode(bytecode: &[u8], encode_key: u8) -> String {
-    let chunk = deserializer::deserialize(bytecode, encode_key).unwrap();
+    let chunk = match deserializer::deserialize(bytecode, encode_key) {
+        Ok(chunk) => chunk,
+        Err(error) => return format!("failed to deserialize bytecode: {error}"),
+    };
     match chunk {
         Bytecode::Error(msg) => msg,
         Bytecode::Chunk(chunk) => {

@@ -133,12 +133,11 @@ impl Instruction {
             | 68
             | 70
             | 71..=75
-            | 81
-            | 82 => {
+            | 81..=85 => {
                 let (a, b, c) = Self::parse_abc(insn);
 
                 Ok(Self::BC {
-                    op_code: OpCode::try_from(op_code).unwrap(),
+                    op_code: OpCode::try_from(op_code).map_err(|_| nom::error::ErrorKind::Tag)?,
                     a,
                     b,
                     c,
@@ -149,7 +148,7 @@ impl Instruction {
                 let (a, d) = Self::parse_ad(insn);
 
                 Ok(Self::AD {
-                    op_code: OpCode::try_from(op_code).unwrap(),
+                    op_code: OpCode::try_from(op_code).map_err(|_| nom::error::ErrorKind::Tag)?,
                     a,
                     d,
                     aux: 0,
@@ -159,18 +158,18 @@ impl Instruction {
                 let e = Self::parse_e(insn);
 
                 Ok(Self::E {
-                    op_code: OpCode::try_from(op_code).unwrap(),
+                    op_code: OpCode::try_from(op_code).map_err(|_| nom::error::ErrorKind::Tag)?,
                     e,
                 })
             }
             97 => Ok(Self::BC {
-                op_code: OpCode::try_from(0).unwrap(),
+                op_code: OpCode::LOP_NOP,
                 a: 0,
                 b: 0,
                 c: 0,
                 aux: 0,
             }),
-            _ => unreachable!("{}", op_code),
+            _ => Err(nom::error::ErrorKind::Tag),
         }
     }
 
@@ -191,5 +190,56 @@ impl Instruction {
 
     fn parse_e(insn: u32) -> i32 {
         (insn as i32) >> 8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encoded_opcode(op_code: u8, encode_key: u8) -> u8 {
+        (0..=u8::MAX)
+            .find(|candidate| candidate.wrapping_mul(encode_key) == op_code)
+            .expect("encode key must be invertible modulo 256")
+    }
+
+    fn abc_instruction(op_code: u8, encode_key: u8, a: u8, b: u8, c: u8) -> u32 {
+        u32::from(encoded_opcode(op_code, encode_key))
+            | (u32::from(a) << 8)
+            | (u32::from(b) << 16)
+            | (u32::from(c) << 24)
+    }
+
+    #[test]
+    fn parses_version_nine_userdata_opcodes_with_roblox_key() {
+        let encode_key = 203;
+        for (raw_opcode, expected) in [
+            (83, OpCode::LOP_GETUDATAKS),
+            (84, OpCode::LOP_SETUDATAKS),
+            (85, OpCode::LOP_NAMECALLUDATA),
+        ] {
+            let instruction =
+                Instruction::parse(abc_instruction(raw_opcode, encode_key, 1, 2, 3), encode_key)
+                    .unwrap();
+
+            assert!(matches!(
+                instruction,
+                Instruction::BC {
+                    op_code,
+                    a: 1,
+                    b: 2,
+                    c: 3,
+                    ..
+                } if op_code == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_opcodes_without_panicking() {
+        let result = std::panic::catch_unwind(|| Instruction::parse(86, 1));
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_err());
     }
 }

@@ -347,10 +347,15 @@ impl<'a> Lifter<'a> {
                             .into(),
                         );
                     }
-                    OpCode::LOP_GETTABLEKS => {
+                    OpCode::LOP_GETTABLEKS | OpCode::LOP_GETUDATAKS => {
                         let target = self.register(a as _);
                         let table = self.register(b as _);
-                        let key = self.constant(aux as _);
+                        let key_index = if op_code == OpCode::LOP_GETUDATAKS {
+                            aux & 0xffff
+                        } else {
+                            aux
+                        };
+                        let key = self.constant(key_index as _);
                         statements.push(
                             ast::Assign::new(
                                 vec![target.into()],
@@ -383,10 +388,15 @@ impl<'a> Lifter<'a> {
                             .into(),
                         );
                     }
-                    OpCode::LOP_SETTABLEKS => {
+                    OpCode::LOP_SETTABLEKS | OpCode::LOP_SETUDATAKS => {
                         let value = self.register(a as _);
                         let table = self.register(b as _);
-                        let key = self.constant(aux as _);
+                        let key_index = if op_code == OpCode::LOP_SETUDATAKS {
+                            aux & 0xffff
+                        } else {
+                            aux
+                        };
+                        let key = self.constant(key_index as _);
                         statements.push(
                             ast::Assign::new(
                                 vec![ast::Index::new(table.into(), key.into()).into()],
@@ -500,10 +510,15 @@ impl<'a> Lifter<'a> {
                     | OpCode::LOP_FASTCALL2
                     | OpCode::LOP_FASTCALL2K
                     | OpCode::LOP_FASTCALL3 => {}
-                    OpCode::LOP_NAMECALL => {
+                    OpCode::LOP_NAMECALL | OpCode::LOP_NAMECALLUDATA => {
                         let namecall_base = a;
                         let namecall_object = self.register(b as _);
-                        let namecall_method = match self.constant(aux as usize) {
+                        let key_index = if op_code == OpCode::LOP_NAMECALLUDATA {
+                            aux & 0xffff
+                        } else {
+                            aux
+                        };
+                        let namecall_method = match self.constant(key_index as usize) {
                             ast::Literal::String(string) => String::from_utf8(string).unwrap(),
                             _ => unreachable!(),
                         };
@@ -1191,10 +1206,35 @@ impl<'a> Lifter<'a> {
                         ));
                     }
                     OpCode::LOP_DUPTABLE => {
+                        let template = self.function_list[self.function.id]
+                            .constants
+                            .get(d as usize)
+                            .cloned();
+                        let entries = match template {
+                            Some(BytecodeConstant::Table(keys)) => keys
+                                .into_iter()
+                                .map(|key| {
+                                    (
+                                        Some(self.constant(key).into()),
+                                        ast::Literal::Number(0.0).into(),
+                                    )
+                                })
+                                .collect(),
+                            Some(BytecodeConstant::TableWithConstants(entries)) => entries
+                                .into_iter()
+                                .map(|(key, value)| {
+                                    let value = value
+                                        .map(|value| self.constant(value))
+                                        .unwrap_or(ast::Literal::Number(0.0));
+                                    (Some(self.constant(key).into()), value.into())
+                                })
+                                .collect(),
+                            _ => Vec::new(),
+                        };
                         statements.push(
                             ast::Assign::new(
                                 vec![self.register(a as _).into()],
-                                vec![ast::Table::default().into()],
+                                vec![ast::Table(entries).into()],
                             )
                             .into(),
                         );
@@ -1315,6 +1355,7 @@ impl<'a> Lifter<'a> {
             BytecodeConstant::Nil => ast::Literal::Nil,
             BytecodeConstant::Boolean(v) => ast::Literal::Boolean(*v),
             BytecodeConstant::Number(v) => ast::Literal::Number(*v),
+            BytecodeConstant::Integer(v) => ast::Literal::Integer(*v),
             BytecodeConstant::String(v) => {
                 // TODO: what does the official deserializer do if v == 0?
                 ast::Literal::String(self.string_table[*v - 1].clone())
