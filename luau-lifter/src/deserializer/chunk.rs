@@ -2,7 +2,10 @@ use super::{function::Function, list::parse_list, parse_string};
 use nom::character::complete::char;
 use nom::multi::many_till;
 use nom::number::complete::le_u8;
-use nom::IResult;
+use nom::{
+    error::{Error, ErrorKind},
+    Err, IResult,
+};
 use nom_leb128::leb128_usize;
 
 #[derive(Debug)]
@@ -19,8 +22,8 @@ impl Chunk {
         } else {
             (input, 0)
         };
-        if types_version > 3 {
-            panic!("unsupported types version");
+        if !(1..=3).contains(&types_version) {
+            return Err(Err::Failure(Error::new(input, ErrorKind::Verify)));
         }
         let (input, string_table) = parse_list(input, parse_string)?;
         let input = if types_version == 3 {
