@@ -1,4 +1,5 @@
 use base64::decode;
+use env_logger::Target;
 use hyper::body::HttpBody as _;
 use hyper::header::{HeaderValue, CONTENT_LENGTH, CONTENT_TYPE};
 use hyper::server::conn::AddrStream;
@@ -9,8 +10,11 @@ use luau_lifter::decompile_bytecode;
 use std::any::Any;
 use std::convert::Infallible;
 use std::env;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -18,9 +22,10 @@ const MIB: usize = 1024 * 1024;
 const DEFAULT_MAX_BODY_MIB: usize = 64;
 const DEFAULT_WARN_MIB: usize = 8;
 const DEFAULT_PORT: u16 = 9002;
-const RECEIVE_PROGRESS_BYTES: usize = 8 * MIB;
+const RECEIVE_PROGRESS_BYTES: usize = MIB;
 const ROBLOX_ENCODE_KEY: u8 = 203;
 
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_DECOMPILATIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -28,6 +33,61 @@ static ACTIVE_DECOMPILATIONS: AtomicUsize = AtomicUsize::new(0);
 struct ServerConfig {
     max_body_bytes: usize,
     warn_bytes: usize,
+}
+
+struct TeeWriter {
+    file: File,
+}
+
+impl Write for TeeWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let mut stderr = io::stderr().lock();
+        let _ = stderr.write_all(buffer);
+        let _ = stderr.flush();
+
+        self.file.write_all(buffer)?;
+        self.file.flush()?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let _ = io::stderr().flush();
+        self.file.flush()
+    }
+}
+
+fn default_log_path() -> PathBuf {
+    env::current_exe()
+        .ok()
+        .map(|path| path.with_extension("log"))
+        .unwrap_or_else(|| PathBuf::from("decomp-server.log"))
+}
+
+fn init_logger() -> Option<PathBuf> {
+    let log_path = env::var_os("DECOMP_LOG_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_log_path);
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().filter_or("DECOMP_LOG", "info"));
+    builder.format_timestamp_millis();
+
+    match OpenOptions::new().create(true).append(true).open(&log_path) {
+        Ok(mut file) => {
+            let _ = writeln!(file, "\n--- decomp-server process starting ---");
+            let _ = file.flush();
+            builder.target(Target::Pipe(Box::new(TeeWriter { file })));
+            builder.init();
+            Some(log_path)
+        }
+        Err(error) => {
+            eprintln!(
+                "warning: could not open diagnostic log {}: {error}",
+                log_path.display()
+            );
+            builder.init();
+            None
+        }
+    }
 }
 
 fn read_mib_setting(name: &str, default_mib: usize) -> usize {
@@ -97,6 +157,7 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
 async fn handle_request(
     request: Request<Body>,
     remote_addr: SocketAddr,
+    connection_id: u64,
     config: ServerConfig,
 ) -> Result<Response<Body>, Infallible> {
     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
@@ -109,7 +170,7 @@ async fn handle_request(
         .and_then(|value| value.parse::<usize>().ok());
 
     info!(
-        "[request {request_id}] accepted {remote_addr} {} {} (Content-Length: {})",
+        "[request {request_id}] accepted on connection {connection_id} from {remote_addr}: {} {} (Content-Length: {})",
         parts.method,
         parts.uri,
         announced_length
@@ -132,6 +193,7 @@ async fn handle_request(
     let initial_capacity = announced_length.unwrap_or(0).min(RECEIVE_PROGRESS_BYTES);
     let mut encoded_body = Vec::with_capacity(initial_capacity);
     let mut next_progress = RECEIVE_PROGRESS_BYTES;
+    let mut chunk_count = 0usize;
 
     while let Some(chunk_result) = body.data().await {
         let chunk = match chunk_result {
@@ -142,6 +204,14 @@ async fn handle_request(
                 return Ok(text_response(StatusCode::BAD_REQUEST, message));
             }
         };
+
+        chunk_count += 1;
+        if chunk_count == 1 {
+            info!(
+                "[request {request_id}] first body chunk received: {}",
+                format_bytes(chunk.len())
+            );
+        }
 
         if config.max_body_bytes != 0
             && chunk.len() > config.max_body_bytes.saturating_sub(encoded_body.len())
@@ -180,7 +250,7 @@ async fn handle_request(
     }
 
     info!(
-        "[request {request_id}] body received: {} of Base64 in {:.3}s",
+        "[request {request_id}] body received: {} of Base64 in {chunk_count} chunks over {:.3}s",
         format_bytes(encoded_body.len()),
         receive_started.elapsed().as_secs_f64()
     );
@@ -279,9 +349,7 @@ async fn handle_request(
 
 #[tokio::main]
 async fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().filter_or("DECOMP_LOG", "info"))
-        .format_timestamp_millis()
-        .init();
+    let log_path = init_logger();
 
     let config = ServerConfig {
         max_body_bytes: read_mib_setting("DECOMP_MAX_BODY_MB", DEFAULT_MAX_BODY_MIB),
@@ -290,6 +358,12 @@ async fn main() {
     let addr = SocketAddr::from(([127, 0, 0, 1], read_port()));
 
     info!("decomp-server v{} starting", env!("CARGO_PKG_VERSION"));
+    info!("process id: {}", std::process::id());
+    if let Some(log_path) = log_path {
+        info!("persistent diagnostic log: {}", log_path.display());
+    } else {
+        warn!("persistent diagnostic log is unavailable; console logging only");
+    }
     info!("diagnostic logging enabled (DECOMP_LOG default: info; example: DECOMP_LOG=debug)");
     info!(
         "request body limit: {} (set DECOMP_MAX_BODY_MB=0 for unlimited)",
@@ -301,10 +375,12 @@ async fn main() {
     );
 
     let make_service = make_service_fn(move |connection: &AddrStream| {
+        let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         let remote_addr = connection.remote_addr();
+        info!("[connection {connection_id}] TCP connection opened from {remote_addr}");
         async move {
             Ok::<_, Infallible>(service_fn(move |request| {
-                handle_request(request, remote_addr, config)
+                handle_request(request, remote_addr, connection_id, config)
             }))
         }
     });
